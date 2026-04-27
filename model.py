@@ -194,7 +194,7 @@ class GPT(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device)
-
+    
         # forward the GPT model
         tok_emb = self.transformer.wte(idx)  # (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos)  # (t, n_embd)
@@ -202,16 +202,14 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
-
+    
+        # Always compute full logits
+        logits = self.lm_head(x)  # (b, t, vocab_size)
+        
+        loss = None
         if targets is not None:
-            # training mode: compute full logits and loss
-            logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference mode: compute logits for last position only
-            logits = self.lm_head(x[:, [-1], :])
-            loss = None
-
+    
         return logits, loss
 
     def crop_block_size(self, block_size):

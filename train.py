@@ -25,12 +25,12 @@ from model import GPTConfig, GPT
 # ============================================================================
 
 # I/O
-out_dir = 'out'
+out_dir = '.'
 eval_interval = 500
 log_interval = 10
 eval_iters = 100
 eval_only = False
-always_save_checkpoint = True
+always_save_checkpoint = False
 init_from = 'scratch'  # 'scratch' or 'resume'
 
 # wandb logging
@@ -138,14 +138,14 @@ model_args = dict(
 if init_from == 'scratch':
     print("Initializing a new model from scratch")
     if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2: 50304")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+        print("defaulting to vocab_size of GPT-2: 50257")
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50257
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = os.path.join(out_dir, 'checkpoint.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['config']
     
@@ -275,7 +275,7 @@ while True:
                     'best_val_loss': best_val_loss,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint_dict, os.path.join(out_dir, 'ckpt.pt'))
+                torch.save(checkpoint_dict, os.path.join(out_dir, 'checkpoint.pt'))
 
     if iter_num == 0 and eval_only:
         break
@@ -319,4 +319,4 @@ while True:
         break
 
 print(f"\nTraining completed. Best val loss: {best_val_loss:.4f}")
-print(f"Final checkpoint saved to {out_dir}/ckpt.pt")
+print(f"Final checkpoint saved to {out_dir}/checkpoint.pt")
