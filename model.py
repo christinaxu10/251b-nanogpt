@@ -221,11 +221,21 @@ class GPT(nn.Module):
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        """Configure optimizer for training"""
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # weight decay only on 2D parameters (weights, not biases or layer norms)
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, optimizer_name='adamw'):
+        """
+        Configure optimizer for training.
+    
+        Args:
+          weight_decay: float
+          learning_rate: float
+          betas: tuple for AdamW
+          device_type: 'cuda' or 'cpu'
+          optimizer_name: 'adamw' or 'muon'
+        Returns:
+          optimizer instance (or list/dict if you want multiple)
+        """
+        # separate params into decay / no-decay groups (2D vs 1D)
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
@@ -236,13 +246,34 @@ class GPT(nn.Module):
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-        return optimizer
+    
+        optimizer_name = optimizer_name.lower()
+        if optimizer_name == 'adamw':
+            # use fused if available on CUDA
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == 'cuda'
+            extra_args = dict(fused=True) if use_fused else dict()
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+            print(f"using fused AdamW: {use_fused}")
+            return optimizer
+        elif optimizer_name == 'muon':
+            # use the Muon optimizer for the 2D parameters only; keep a fallback optimizer
+            # Create two groups: one Muon group for 2D params, and an AdamW for the rest.
+            from muon import Muon
+            muon_group = {'params': decay_params}
+            muon_opt = Muon(decay_params, lr=learning_rate, momentum=0.95, nesterov=True,
+                            backend='newtonschulz5', backend_steps=5)
+            
+            # AdamW for 1D params so embeddings / biases / norms get a standard optimizer
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == 'cuda'
+            extra_args = dict(fused=True) if use_fused else dict()
+            adam_for_1d = torch.optim.AdamW(nodecay_params, lr=learning_rate * 0.5, betas=betas, **extra_args)
+            
+            print(f"using Muon for 2D params and AdamW for 1D params (fused: {use_fused})")
+            return (muon_opt, adam_for_1d)
+        else:
+            raise ValueError(f"Unknown optimizer_name: {optimizer_name}")
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS"""

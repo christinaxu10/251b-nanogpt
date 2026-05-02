@@ -68,6 +68,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = False
 gradient_accumulation_steps = 1
+optim = 'adamw' # 'adamw' or 'muon'
 
 # ============================================================================
 # Command-line overrides
@@ -163,7 +164,7 @@ elif init_from == 'resume':
 
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
-
+    
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
 
@@ -175,17 +176,40 @@ elif init_from == 'resume':
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 
+    if 'optim' in checkpoint:
+        optim = checkpoint['optim']
+
 model.to(device)
 
 # ============================================================================
 # Optimizer & Training Setup
 # ============================================================================
 
+
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+
+opt_created = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type, optimizer_name=optim)
+if isinstance(opt_created, tuple):
+    # unpack muon + adam
+    optimizers = list(opt_created)
+else:
+    optimizers = [opt_created]
+# downstream code expects "optimizer"; we keep both forms compatible:
+# if single optimizer list, we use optimizer = optimizers[0] for scaler.step(optimizer)
+# if multiple, we will step them all inside the training loop.
 
 if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    # checkpoint may have saved optimizer state under 'optimizer' (single) or 'optimizers' (list)
+    if 'optimizer' in checkpoint and len(optimizers) == 1:
+        optimizers[0].load_state_dict(checkpoint['optimizer'])
+    elif 'optimizers' in checkpoint:
+        saved_list = checkpoint['optimizers']
+        # naive mapping: load each into corresponding optimizer if lengths match
+        if len(saved_list) == len(optimizers):
+            for o, s in zip(optimizers, saved_list):
+                o.load_state_dict(s)
+        else:
+            print("Warning: number of saved optimizers doesn't match current optimizers; skipping optimizer state restore")
 
 checkpoint = None
 
@@ -257,6 +281,7 @@ def save_loss_plot(train_losses, config, out_dir='.', filename='loss_final.png')
         'n_layer',
         'n_head',
         'n_embd',
+        'optim',
         'dropout',
         'batch_size',
         'block_size',
@@ -342,8 +367,10 @@ while True:
 
     lr = get_lr(iter_num) if decay_lr else learning_rate
 
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    # set learning rate for all optimizers and their param groups
+    for opt in optimizers:
+        for param_group in opt.param_groups:
+            param_group['lr'] = lr
 
     # Evaluate and checkpoint
     if iter_num % eval_interval == 0:
@@ -371,11 +398,17 @@ while True:
             if iter_num > 0:
                 checkpoint_dict = {
                     'model': model.state_dict() if not compile else model.module.state_dict(),
-                    'optimizer': optimizer.state_dict(),
                     'config': model_args,
+                    'optim': optim, # optimizer name
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                 }
+                
+                # add optimizer states
+                if len(optimizers) == 1:
+                    checkpoint_dict['optimizer'] = optimizers[0].state_dict()
+                else:
+                    checkpoint_dict['optimizers'] = [o.state_dict() for o in optimizers]
 
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint_dict, os.path.join(out_dir, 'checkpoint.pt'))
@@ -394,13 +427,32 @@ while True:
 
     # Gradient clipping
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
+        for opt in optimizers:
+            try:
+                scaler.unscale_(opt)
+            except Exception:
+                # custom optimizers like Muon may not be compatible with the GradScaler unscale API
+                pass
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
     # Optimizer step
-    scaler.step(optimizer)
-    scaler.update()
-    optimizer.zero_grad(set_to_none=True)
+    for opt in optimizers:
+        try:
+            # scaler.step supports stepping only for optimizers that use CUDA amp scaler
+            scaler.step(opt)
+        except Exception:
+            # if scaler.step fails for a non-supported optimizer (Muon likely doesn't use scaler), call opt.step()
+            opt.step()
+    
+    scaler.update() # update scaler once
+    
+    # zero grads on model
+    for opt in optimizers:
+        try:
+            opt.zero_grad(set_to_none=True)
+        except TypeError:
+            # Some custom optimizers may not accept set_to_none kw; fall back
+            opt.zero_grad()
 
     # Timing and logging
     t1 = time.time()
