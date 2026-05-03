@@ -260,16 +260,24 @@ class GPT(nn.Module):
             # use the Muon optimizer for the 2D parameters only; keep a fallback optimizer
             # Create two groups: one Muon group for 2D params, and an AdamW for the rest.
             from muon import Muon
-            muon_group = {'params': decay_params}
-            muon_opt = Muon(decay_params, lr=learning_rate, momentum=0.95, nesterov=True,
+            
+            muon_lr = 0.01  # set via experimentation
+            muon_opt = Muon(decay_params, lr=muon_lr, momentum=0.95, nesterov=True,
                             backend='newtonschulz5', backend_steps=5)
             
-            # AdamW for 1D params so embeddings / biases / norms get a standard optimizer
+            # AdamW for 1D and scalar params so embeddings / biases / norms get a standard optimizer
             fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
             use_fused = fused_available and device_type == 'cuda'
             extra_args = dict(fused=True) if use_fused else dict()
-            adam_for_1d = torch.optim.AdamW(nodecay_params, lr=learning_rate * 0.5, betas=betas, **extra_args)
             
+            adamw_lr = 3e-4  # set via experimentation
+            adam_for_1d = torch.optim.AdamW(nodecay_params, lr=adamw_lr, betas=betas, **extra_args)
+
+            for pg in muon_opt.param_groups:
+                pg['initial_lr'] = muon_lr
+            for pg in adam_for_1d.param_groups:
+                pg['initial_lr'] = adamw_lr
+
             print(f"using Muon for 2D params and AdamW for 1D params (fused: {use_fused})")
             return (muon_opt, adam_for_1d)
         else:

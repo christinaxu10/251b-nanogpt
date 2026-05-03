@@ -185,7 +185,6 @@ model.to(device)
 # Optimizer & Training Setup
 # ============================================================================
 
-
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 opt_created = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type, optimizer_name=optim)
@@ -194,9 +193,6 @@ if isinstance(opt_created, tuple):
     optimizers = list(opt_created)
 else:
     optimizers = [opt_created]
-# downstream code expects "optimizer"; we keep both forms compatible:
-# if single optimizer list, we use optimizer = optimizers[0] for scaler.step(optimizer)
-# if multiple, we will step them all inside the training loop.
 
 if init_from == 'resume':
     # checkpoint may have saved optimizer state under 'optimizer' (single) or 'optimizers' (list)
@@ -339,6 +335,14 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (learning_rate - min_lr)
 
+def get_lr_multiplier(it):
+    if it < warmup_iters:
+        return (it + 1) / (warmup_iters + 1)
+
+    progress = min(1.0, (it - warmup_iters) / max(1, lr_decay_iters - warmup_iters))
+    coef = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return coef
+
 # ============================================================================
 # WandB logging
 # ============================================================================
@@ -365,32 +369,61 @@ print(f"Device: {device}, dtype: {dtype}\n")
 
 while True:
 
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-
-    # set learning rate for all optimizers and their param groups
-    for opt in optimizers:
-        for param_group in opt.param_groups:
-            param_group['lr'] = lr
+    if len(optimizers) == 1: # AdamW
+        lr = get_lr(iter_num) if decay_lr else learning_rate
+    
+        # set learning rate for all optimizers and their param groups
+        for opt in optimizers:
+            for param_group in opt.param_groups:
+                param_group['lr'] = lr
+    elif len(optimizers) == 2: # Muon and AdamW
+        lr_multiplier = get_lr_multiplier(iter_num) if decay_lr else 1.0
+        # scale each param_group from its stored base initial_lr (fallback to current lr)
+        for opt in optimizers:
+            for pg in opt.param_groups:
+                base = pg.get('initial_lr', pg['lr'])
+                pg['lr'] = min_lr + base * lr_multiplier * (1.0 - min_lr / base)
 
     # Evaluate and checkpoint
     if iter_num % eval_interval == 0:
         losses = estimate_loss()
 
-        print(
-            f"step {iter_num:5d} | "
-            f"train loss {losses['train']:.4f} | "
-            f"val loss {losses['val']:.4f} | "
-            f"lr {lr:.2e}"
-        )
+        if len(optimizers) == 2:
+            muon_lr = optimizers[0].param_groups[0]['lr']
+            adamw_lr = optimizers[1].param_groups[0]['lr']
+            print(
+                f"step {iter_num:5d} | "
+                f"train loss {losses['train']:.4f} | "
+                f"val loss {losses['val']:.4f} | "
+                f"muon_lr {muon_lr:.2e} | adamw_lr {adamw_lr:.2e}"
+            )
+        elif len(optimizers) == 1:
+            adamw_lr = optimizers[0].param_groups[0]['lr']
+            print(
+                f"step {iter_num:5d} | "
+                f"train loss {losses['train']:.4f} | "
+                f"val loss {losses['val']:.4f} | "
+                f"adamw_lr {adamw_lr:.2e}"
+            )
 
         if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu * 100,
-            })
+            if len(optimizers) == 2:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "muon_lr": muon_lr,
+                    "adamw_lr": adamw_lr,
+                    "mfu": running_mfu * 100,
+                })
+            else:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "adamw_lr": adamw_lr,
+                    "mfu": running_mfu * 100,
+                })
 
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -399,7 +432,7 @@ while True:
                 checkpoint_dict = {
                     'model': model.state_dict() if not compile else model.module.state_dict(),
                     'config': model_args,
-                    'optim': optim, # optimizer name
+                    'optim': optim,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                 }
