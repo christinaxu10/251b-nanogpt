@@ -18,7 +18,7 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-from model import GPTConfig, GPT
+from model_2 import GPTConfig, GPT
 
 # Add matplotlib for plotting losses (headless-friendly)
 import matplotlib
@@ -429,8 +429,10 @@ while True:
             best_val_loss = losses['val']
 
             if iter_num > 0:
+                raw_model = model._orig_mod if compile else model
+                
                 checkpoint_dict = {
-                    'model': model.state_dict() if not compile else model.module.state_dict(),
+                    'model': raw_model.state_dict(),
                     'config': model_args,
                     'optim': optim,
                     'iter_num': iter_num,
@@ -497,7 +499,8 @@ while True:
         train_losses.append(float(lossf))
 
         if iter_num > 5:
-            mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            raw_model = model._orig_mod if compile else model
+            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
 
             print(
