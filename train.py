@@ -18,7 +18,7 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-from model import GPTConfig, GPT
+from model_2 import GPTConfig, GPT
 
 # Add matplotlib for plotting losses (headless-friendly)
 import matplotlib
@@ -68,6 +68,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = False
 gradient_accumulation_steps = 1
+optim = 'adamw' # 'adamw' or 'muon'
 
 # ============================================================================
 # Command-line overrides
@@ -163,7 +164,7 @@ elif init_from == 'resume':
 
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
-
+    
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
 
@@ -175,6 +176,9 @@ elif init_from == 'resume':
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 
+    if 'optim' in checkpoint:
+        optim = checkpoint['optim']
+
 model.to(device)
 
 # ============================================================================
@@ -182,10 +186,26 @@ model.to(device)
 # ============================================================================
 
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+
+opt_created = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type, optimizer_name=optim)
+if isinstance(opt_created, tuple):
+    # unpack muon + adam
+    optimizers = list(opt_created)
+else:
+    optimizers = [opt_created]
 
 if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+    # checkpoint may have saved optimizer state under 'optimizer' (single) or 'optimizers' (list)
+    if 'optimizer' in checkpoint and len(optimizers) == 1:
+        optimizers[0].load_state_dict(checkpoint['optimizer'])
+    elif 'optimizers' in checkpoint:
+        saved_list = checkpoint['optimizers']
+        # naive mapping: load each into corresponding optimizer if lengths match
+        if len(saved_list) == len(optimizers):
+            for o, s in zip(optimizers, saved_list):
+                o.load_state_dict(s)
+        else:
+            print("Warning: number of saved optimizers doesn't match current optimizers; skipping optimizer state restore")
 
 checkpoint = None
 
@@ -257,6 +277,7 @@ def save_loss_plot(train_losses, config, out_dir='.', filename='loss_final.png')
         'n_layer',
         'n_head',
         'n_embd',
+        'optim',
         'dropout',
         'batch_size',
         'block_size',
@@ -314,6 +335,14 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (learning_rate - min_lr)
 
+def get_lr_multiplier(it):
+    if it < warmup_iters:
+        return (it + 1) / (warmup_iters + 1)
+
+    progress = min(1.0, (it - warmup_iters) / max(1, lr_decay_iters - warmup_iters))
+    coef = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return coef
+
 # ============================================================================
 # WandB logging
 # ============================================================================
@@ -340,42 +369,81 @@ print(f"Device: {device}, dtype: {dtype}\n")
 
 while True:
 
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    if len(optimizers) == 1: # AdamW
+        lr = get_lr(iter_num) if decay_lr else learning_rate
+    
+        # set learning rate for all optimizers and their param groups
+        for opt in optimizers:
+            for param_group in opt.param_groups:
+                param_group['lr'] = lr
+    elif len(optimizers) == 2: # Muon and AdamW
+        lr_multiplier = get_lr_multiplier(iter_num) if decay_lr else 1.0
+        # scale each param_group from its stored base initial_lr (fallback to current lr)
+        for opt in optimizers:
+            for pg in opt.param_groups:
+                base = pg.get('initial_lr', pg['lr'])
+                pg['lr'] = min_lr + base * lr_multiplier * (1.0 - min_lr / base)
 
     # Evaluate and checkpoint
     if iter_num % eval_interval == 0:
         losses = estimate_loss()
 
-        print(
-            f"step {iter_num:5d} | "
-            f"train loss {losses['train']:.4f} | "
-            f"val loss {losses['val']:.4f} | "
-            f"lr {lr:.2e}"
-        )
+        if len(optimizers) == 2:
+            muon_lr = optimizers[0].param_groups[0]['lr']
+            adamw_lr = optimizers[1].param_groups[0]['lr']
+            print(
+                f"step {iter_num:5d} | "
+                f"train loss {losses['train']:.4f} | "
+                f"val loss {losses['val']:.4f} | "
+                f"muon_lr {muon_lr:.2e} | adamw_lr {adamw_lr:.2e}"
+            )
+        elif len(optimizers) == 1:
+            adamw_lr = optimizers[0].param_groups[0]['lr']
+            print(
+                f"step {iter_num:5d} | "
+                f"train loss {losses['train']:.4f} | "
+                f"val loss {losses['val']:.4f} | "
+                f"adamw_lr {adamw_lr:.2e}"
+            )
 
         if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu * 100,
-            })
+            if len(optimizers) == 2:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "muon_lr": muon_lr,
+                    "adamw_lr": adamw_lr,
+                    "mfu": running_mfu * 100,
+                })
+            else:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "adamw_lr": adamw_lr,
+                    "mfu": running_mfu * 100,
+                })
 
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
 
             if iter_num > 0:
+                raw_model = model._orig_mod if compile else model
+                
                 checkpoint_dict = {
-                    'model': model.state_dict() if not compile else model.module.state_dict(),
-                    'optimizer': optimizer.state_dict(),
+                    'model': raw_model.state_dict(),
                     'config': model_args,
+                    'optim': optim,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                 }
+                
+                # add optimizer states
+                if len(optimizers) == 1:
+                    checkpoint_dict['optimizer'] = optimizers[0].state_dict()
+                else:
+                    checkpoint_dict['optimizers'] = [o.state_dict() for o in optimizers]
 
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint_dict, os.path.join(out_dir, 'checkpoint.pt'))
@@ -394,13 +462,32 @@ while True:
 
     # Gradient clipping
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
+        for opt in optimizers:
+            try:
+                scaler.unscale_(opt)
+            except Exception:
+                # custom optimizers like Muon may not be compatible with the GradScaler unscale API
+                pass
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
     # Optimizer step
-    scaler.step(optimizer)
-    scaler.update()
-    optimizer.zero_grad(set_to_none=True)
+    for opt in optimizers:
+        try:
+            # scaler.step supports stepping only for optimizers that use CUDA amp scaler
+            scaler.step(opt)
+        except Exception:
+            # if scaler.step fails for a non-supported optimizer (Muon likely doesn't use scaler), call opt.step()
+            opt.step()
+    
+    scaler.update() # update scaler once
+    
+    # zero grads on model
+    for opt in optimizers:
+        try:
+            opt.zero_grad(set_to_none=True)
+        except TypeError:
+            # Some custom optimizers may not accept set_to_none kw; fall back
+            opt.zero_grad()
 
     # Timing and logging
     t1 = time.time()
@@ -412,7 +499,8 @@ while True:
         train_losses.append(float(lossf))
 
         if iter_num > 5:
-            mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            raw_model = model._orig_mod if compile else model
+            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
 
             print(
